@@ -1,33 +1,69 @@
 """
 KS4_to_analysis.py
 
+
 Load KiloSort4 output, pack a single analysis file (NPZ) with:
 - spike_times_s: 1D float array of spike times (seconds)
 - spike_unit_ids: 1D int array (same length) giving the unit id for each spike
 - unit_ids: 1D int array listing all unit IDs (order used elsewhere)
 - icms_sec: 1D float array of trial start times (seconds)
 - fs: float sampling rate (Hz) from the sorter
-- meta: JSON string with creation info and params
+- meta: JSON string with creation info and params (includes absolute ks_folder path)
+
 
 Also includes helper functions to:
 - compute icms_sec from ttl_ap_frames (AP sample indices) and fs
-- plot a PSTH for a given unit
-- build and plot trial-averaged low‑D neural trajectories (PCA)
+- plot a PSTH with flexible selection:
+• single unit (pass an int unit_id)
+• grand‑average over good units (pass path to good_units.csv)
+• grand‑average over all units (pass None)
+• you can also pass a list/array of unit IDs to average
+- overlay **per‑trial** low‑D neural trajectories (PCA) in a shared basis across trials
+- plot **trial‑averaged** low‑D neural trajectories (PCA)
+- optional filtering by **good units** for the trajectory plots via:
+• good_units=True → auto‑load "{ks_folder}/good_units.csv" from NPZ meta
+• good_units="/path/to/good_units.csv" → explicit CSV path
+• good_units=[...] → list/array of unit IDs
+
+
+CSV format for good units (robust to header/no‑header):
+unit_id
+92
+93
+...
+
 
 Usage examples (Python):
 
->>> from KS4_to_analysis import build_npz, plot_psth, plot_avg_trajectory
->>> icms_sec = make_icms_sec(ttl_ap_frames, fs)               # if you have AP-frame onsets
+
+>>> from KS4_to_analysis import build_npz, make_icms_sec, plot_psth, plot_trial_trajectories, plot_avg_trajectory
+>>> icms_sec = make_icms_sec(ttl_ap_frames, fs) # if you have AP‑frame onsets
 >>> build_npz(sorter_output='path/to/sorter_output', icms_sec=icms_sec, outfile='session.npz')
+
+
+# PSTH — single unit
 >>> plot_psth('session.npz', unit_id=10, t_before=0.2, t_after=0.6, bin_size=0.01)
->>> plot_avg_trajectory('session.npz', units=None, t_before=0.2, t_after=0.6, bin_size=0.02, n_components=3)
+# PSTH — grand‑average of good units from CSV
+>>> plot_psth('session.npz', unit_id='path/to/output_folder/good_units.csv')
+# PSTH — grand‑average of all units
+>>> plot_psth('session.npz', unit_id=None)
+
+
+# Overlay per‑trial trajectories (shared PCA space), filter to good units found next to KS output
+>>> plot_trial_trajectories('session.npz', good_units=True, t_before=0.2, t_after=0.6, bin_size=0.02, n_components=3)
+
+
+# Trial‑averaged trajectory with an explicit CSV of good units
+>>> plot_avg_trajectory('session.npz', good_units='path/to/output_folder/good_units.csv', n_components=3)
+
 
 CLI (optional):
 $ python KS4_to_analysis.py --ks path/to/sorter_output --icms path/to/icms.npy --out session.npz
 
+
 Notes:
-- This is read-only; it won’t modify sorter outputs.
-- It is robust to SpikeInterface versions by trying multiple reader entry points.
+- This is read‑only; it won’t modify sorter outputs.
+- Robust to SpikeInterface versions by trying multiple reader entry points.
 - Ensure your icms_sec and sorting share the same time reference.
 """
 
