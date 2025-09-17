@@ -37,8 +37,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
-import spikeinterface.extractors as se 
-
 
 import numpy as np
 
@@ -50,10 +48,18 @@ def _read_kilosort(folder: str | Path):
     """
     folder = str(folder)
     # New API (>=0.98):
-    # try:
-    return se.read_kilosort(folder)  # type: ignore
-    # except Exception as exc:
-    #     raise ImportError("Could not import SpikeInterface KiloSort reader. Please install spikeinterface.") from exc
+    try:
+        import spikeinterface as si  # noqa: F401
+        from spikeinterface.extractors import read_kilosort  # type: ignore
+        return read_kilosort(folder)
+    except Exception:
+        pass
+    # Older API:
+    try:
+        import spikeinterface.extractors as se  # type: ignore
+        return se.read_kilosort(folder)  # type: ignore
+    except Exception as exc:
+        raise ImportError("Could not import SpikeInterface KiloSort reader. Please install spikeinterface.") from exc
 
 
 # ---- Core packaging ----
@@ -167,6 +173,117 @@ def make_icms_sec(ttl_ap_frames: dict, fs: float) -> np.ndarray:
     raise KeyError("No 'icms', 'nerve', or 'opto' key found in ttl_ap_frames.")
 
 
+# ---- Good-units utilities ----
+
+def _load_good_units_from_csv(csv_path: str | Path) -> np.ndarray:
+    """Load good unit IDs from a CSV (robust to header/no‑header). Returns 1D int array.
+    Accepts a single column named 'unit_id' or the first column as IDs.
+    """
+    import numpy as np
+    from pathlib import Path
+
+    p = Path(csv_path)
+    if not p.exists():
+        raise FileNotFoundError(f"good_units CSV not found: {p}")
+
+    # Try headered CSV first
+    try:
+        arr = np.genfromtxt(str(p), delimiter=",", names=True, dtype=None, encoding="utf-8")
+        if isinstance(arr, np.ndarray) and arr.dtype.names:
+            # Prefer column that looks like unit id
+            for k in arr.dtype.names:
+                kl = k.lower()
+                if kl == "unit_id" or ("unit" in kl and "id" in kl) or kl in ("unit", "id"):
+                    col = np.asarray(arr[k]).ravel()
+                    return col.astype(int)
+            # Fallback to the first column
+            first = arr.dtype.names[0]
+            col = np.asarray(arr[first]).ravel()
+            return col.astype(int)
+    except Exception:
+        pass
+
+    # Fallbacks: no header / different delimiter
+    for delim in [",", None, "	", ";", " "]:
+        try:
+            arr = np.genfromtxt(str(p), delimiter=delim, dtype=float)
+            if arr.ndim == 0:
+                return np.array([int(arr.item())])
+            if arr.ndim == 1:
+                return arr.astype(int)
+            if arr.ndim == 2:
+                return arr[:, 0].astype(int)
+        except Exception:
+            continue
+
+    raise ValueError(f"Could not parse good_units from CSV: {p}")
+
+
+def _resolve_units_for_plot(npz_path: str | Path, units: Optional[Sequence[int]], good_units: Optional[Sequence[int] | str | bool]) -> Optional[np.ndarray]:
+    """Intersect requested units with good_units (if provided). If good_units is:
+      - Sequence[int]: use directly
+      - str/Path: treat as file OR directory containing 'good_units.csv'
+      - True: auto-load '{ks_folder}/good_units.csv' using meta in NPZ
+    Returns an array of unit IDs or None (to use all from NPZ).
+    """
+    import json
+    from pathlib import Path
+    import numpy as np
+
+    # Start from all units in NPZ
+    dat = np.load(npz_path, allow_pickle=True)
+    all_units = np.asarray(dat["unit_ids"], dtype=int)
+    all_set = set(all_units.tolist())
+
+    if good_units is None:
+        # no filtering; keep 'units' as-is
+        return np.array(units, dtype=int) if units is not None else None
+
+    # Determine good_set
+    good_set: set[int]
+    csv_path: Optional[Path] = None
+
+    if isinstance(good_units, (list, tuple, set, np.ndarray)):
+        good_set = set(int(u) for u in good_units)
+    else:
+        # string/bool/path cases
+        if isinstance(good_units, bool) and good_units is True:
+            # auto from ks_folder in meta
+            meta_raw = dat["meta"]
+            try:
+                meta_raw = meta_raw.item()
+            except Exception:
+                pass
+            if isinstance(meta_raw, bytes):
+                meta_raw = meta_raw.decode("utf-8")
+            meta = json.loads(meta_raw)
+            ks_folder = Path(meta.get("ks_folder", "."))
+            csv_path = ks_folder / "good_units.csv"
+        else:
+            # provided path or directory
+            p = Path(str(good_units))
+            csv_path = p / "good_units.csv" if p.is_dir() else p
+
+        try:
+            good_ids = _load_good_units_from_csv(csv_path)
+            good_set = set(int(x) for x in good_ids)
+        except Exception as exc:
+            print(f"[warn] good_units not applied ({exc}). Using provided 'units' or all units.")
+            return np.array(units, dtype=int) if units is not None else None
+
+    # Intersect with available units in NPZ
+    good_set &= all_set
+
+    if units is not None:
+        final = sorted(good_set & set(int(u) for u in units))
+    else:
+        final = sorted(good_set)
+
+    if len(final) == 0:
+        print("[warn] No units left after good_units filter; using all units.")
+        return None
+    return np.asarray(final, dtype=int)
+
 # ---- Analysis: PSTH ----
 
 def _event_aligned_spikes(spike_times_s: np.ndarray, events: np.ndarray, t_before: float, t_after: float) -> list[np.ndarray]:
@@ -211,26 +328,99 @@ def psth(
 
 def plot_psth(
     npz_path: str | Path,
-    unit_id: int,
+    unit_id: Optional[object] = None,
     t_before: float = 0.2,
     t_after: float = 0.6,
     bin_size: float = 0.01,
     smooth_sigma_bins: float = 1.0,
 ):
-    """Quick PSTH plot for one unit."""
+    """Plot PSTH under three modes based on `unit_id`:
+
+    - int:   plot single-unit PSTH for that unit id
+    - str/Path (CSV): treat as path to good_units CSV and plot **grand-average** PSTH
+    - None:  plot **grand-average** PSTH across *all* units in the NPZ
+
+    You can also pass a sequence of ints to treat as the set of units for grand-average.
+    """
+    import numpy as np
+    from pathlib import Path
     import matplotlib.pyplot as plt
+
     dat = np.load(npz_path, allow_pickle=True)
     spike_times_s = dat["spike_times_s"]
     spike_unit_ids = dat["spike_unit_ids"].astype(int)
+    unit_ids_all = dat["unit_ids"].astype(int)
     icms_sec = dat["icms_sec"]
 
-    st_unit = spike_times_s[spike_unit_ids == int(unit_id)]
-    per_trial = _event_aligned_spikes(st_unit, icms_sec, t_before, t_after)
-    t, rate = psth(per_trial, bin_size=bin_size, smooth_sigma_bins=smooth_sigma_bins)
+    # Fixed edges to ensure consistent averaging across units
+    edges = np.arange(-t_before, t_after + bin_size, bin_size)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    n_trials = int(icms_sec.size)
+
+    # Resolve which units to include & mode
+    mode = "grand"
+    if unit_id is None:
+        units_list = unit_ids_all
+    elif isinstance(unit_id, (int, np.integer)):
+        units_list = np.array([int(unit_id)], dtype=int)
+        mode = "single"
+    elif isinstance(unit_id, (list, tuple, set, np.ndarray)):
+        units_list = np.array([int(u) for u in unit_id], dtype=int)
+    else:
+        # Assume CSV path for good_units
+        try:
+            csv_path = Path(str(unit_id))
+            good_ids = _load_good_units_from_csv(csv_path)
+            units_list = np.array([u for u in good_ids if u in set(unit_ids_all.tolist())], dtype=int)
+            if units_list.size == 0:
+                print(f"[warn] No overlap between good_units in {csv_path} and NPZ units; using all units.")
+                units_list = unit_ids_all
+        except Exception as exc:
+            print(f"[warn] Could not parse units from {unit_id} ({exc}); using all units.")
+            units_list = unit_ids_all
+
+    # Helper: compute per-unit rate over fixed edges
+    def _unit_psth_rate(st_unit: np.ndarray) -> np.ndarray:
+        counts_total = np.zeros(edges.size - 1, dtype=float)
+        if st_unit.size:
+            for ev in icms_sec:
+                rel = st_unit[(st_unit >= ev - t_before) & (st_unit < ev + t_after)] - ev
+                if rel.size:
+                    counts_total += np.histogram(rel, bins=edges)[0]
+        rate = counts_total / (n_trials * bin_size)
+        if smooth_sigma_bins and smooth_sigma_bins > 0:
+            from scipy.ndimage import gaussian_filter1d
+            rate = gaussian_filter1d(rate, smooth_sigma_bins, mode='nearest')
+        return rate
+
+    # Compute
+    if mode == "single":
+        u = int(units_list[0])
+        st_unit = spike_times_s[spike_unit_ids == u]
+        rate = _unit_psth_rate(st_unit)
+        plt.figure()
+        plt.title(f"Unit {u} PSTH (n_trials={n_trials})")
+        plt.plot(centers, rate, lw=2)
+        plt.axvline(0, ls='--')
+        plt.xlabel('Time from event (s)')
+        plt.ylabel('Firing rate (Hz)')
+        plt.show()
+        return
+
+    # Grand-average across units
+    rates = []
+    for u in units_list:
+        st_unit = spike_times_s[spike_unit_ids == int(u)]
+        rates.append(_unit_psth_rate(st_unit))
+    if not rates:
+        print("[warn] No units available; nothing to plot.")
+        return
+    R = np.vstack(rates)
+    mean_rate = R.mean(axis=0)
 
     plt.figure()
-    plt.title(f"Unit {unit_id} PSTH (n_trials={len(icms_sec)})")
-    plt.plot(t, rate, lw=2)
+    plt.title(f"Grand-average PSTH (units={len(units_list)}, trials={n_trials})")
+    plt.plot(centers, mean_rate, lw=2)
     plt.axvline(0, ls='--')
     plt.xlabel('Time from event (s)')
     plt.ylabel('Firing rate (Hz)')
@@ -297,6 +487,7 @@ def build_trial_tensor(
 def plot_avg_trajectory(
     npz_path: str | Path,
     units: Optional[Sequence[int]] = None,
+    good_units: Optional[Sequence[int] | str | bool] = None,
     t_before: float = 0.2,
     t_after: float = 0.6,
     bin_size: float = 0.02,
@@ -307,6 +498,8 @@ def plot_avg_trajectory(
     """Compute PCA across units on the trial‑averaged rates and plot 2D/3D trajectory."""
     import matplotlib.pyplot as plt
     from sklearn.decomposition import PCA
+    # Resolve units with optional good_units CSV filtering
+    units = _resolve_units_for_plot(npz_path, units, good_units)
     tensor, unit_ids, t = build_trial_tensor(
         npz_path=npz_path,
         units=units,
@@ -350,6 +543,115 @@ def plot_avg_trajectory(
         plt.show()
 
 
+# ---- Per-trial population trajectories ----
+
+def plot_trial_trajectories(
+    npz_path: str | Path,
+    units: Optional[Sequence[int]] = None,
+    good_units: Optional[Sequence[int] | str | bool] = None,
+    t_before: float = 0.2,
+    t_after: float = 0.6,
+    bin_size: float = 0.02,
+    smooth_sigma_bins: Optional[float] = 1.0,
+    n_components: int = 3,
+    show_3d: bool = True,
+    alpha: float = 0.35,
+    linewidth: float = 1.5,
+    trials: Optional[Sequence[int]] = None,
+):
+    """Overlay per-trial neural population trajectories in a shared low-D space.
+
+    Steps:
+      1) Build trial × unit × timebin rate tensor.
+      2) Z-score per unit across all trials/time to equalize scale.
+      3) Fit PCA on the concatenation of all trials/time bins (shared basis).
+      4) Project each trial and plot as a line (2D or 3D) overlaid.
+
+    Returns
+      traj_trials: np.ndarray with shape (n_trials, n_tbins, n_components)
+      t:          time vector (seconds, relative to event)
+      pca:        fitted sklearn PCA object if available, else None
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Build tensor: (T, U, B)
+    units = _resolve_units_for_plot(npz_path, units, good_units)
+    tensor, unit_ids, t = build_trial_tensor(
+        npz_path=npz_path,
+        units=units,
+        t_before=t_before,
+        t_after=t_after,
+        bin_size=bin_size,
+        smooth_sigma_bins=smooth_sigma_bins,
+    )
+
+    # Select subset of trials if requested
+    if trials is not None:
+        idx = np.array(list(trials), dtype=int)
+        tensor = tensor[idx]
+
+    T, U, B = tensor.shape
+
+    # Z-score per unit over all trials and timebins so units contribute equally
+    mu = tensor.mean(axis=(0, 2), keepdims=True)                    # (1, U, 1)
+    sd = tensor.std(axis=(0, 2), keepdims=True) + 1e-9
+    z = (tensor - mu) / sd                                          # (T, U, B)
+
+    # Prepare data for PCA fit: stack trials and time bins -> (T*B, U)
+    Z_fit = z.swapaxes(1, 2).reshape(T * B, U)
+
+    # Fit PCA (prefer sklearn, fallback to SVD if not installed)
+    pca = None
+    try:
+        from sklearn.decomposition import PCA  # type: ignore
+        pca = PCA(n_components=n_components)
+        pca.fit(Z_fit)
+        transform = pca.transform
+    except Exception:
+        # Minimal PCA via SVD
+        mean_ = Z_fit.mean(axis=0, keepdims=True)
+        Zc = Z_fit - mean_
+        _, _, Vt = np.linalg.svd(Zc, full_matrices=False)
+        components = Vt[:n_components].T  # (U, C)
+        def transform(Y):
+            return (Y - mean_) @ components
+
+    # Project each trial: (B, U) -> (B, C)
+    traj_trials = np.zeros((T, B, n_components), dtype=float)
+    for ti in range(T):
+        Y = z[ti].T  # (B, U)
+        traj_trials[ti] = transform(Y)
+
+    # Plot overlay
+    zero_idx = int(np.argmin(np.abs(t)))
+    if show_3d and n_components >= 3:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        for ti in range(T):
+            X = traj_trials[ti]
+            ax.plot(X[:, 0], X[:, 1], X[:, 2], lw=linewidth, alpha=alpha)
+            ax.scatter(X[zero_idx, 0], X[zero_idx, 1], X[zero_idx, 2], s=20, alpha=0.8)
+        ax.set_title(f"Per-trial PCA trajectories (trials={T}, U={U})")
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+        plt.show()
+    else:
+        plt.figure()
+        for ti in range(T):
+            X = traj_trials[ti]
+            plt.plot(X[:, 0], X[:, 1], lw=linewidth, alpha=alpha)
+            plt.scatter(X[zero_idx, 0], X[zero_idx, 1], s=15, alpha=0.8)
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        plt.title(f"Per-trial PCA trajectories (trials={T}, U={U})")
+        plt.show()
+
+    return traj_trials, t, pca
+
+
 # ---- CLI ----
 if __name__ == "__main__":
     import argparse
@@ -385,3 +687,5 @@ if __name__ == "__main__":
 
     out = build_npz(ks_folder, icms_sec=icms_sec, outfile=args.out, include_units=units)
     print(f"Saved -> {out}")
+
+
